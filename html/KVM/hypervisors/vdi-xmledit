@@ -1,0 +1,65 @@
+#!/usr/bin/env python
+
+#This script is called after new machine is created
+#It changes emulator path to a kvm-vdi script,
+#Also it enables compression on a SPICE channel for a virtual machine
+
+
+
+import xml.etree.ElementTree as ET
+import sys
+import os
+import platform
+
+x=0
+y=len(sys.argv)
+vmname=""
+while (x != y):
+    namearg=str(sys.argv[x])
+    if (namearg=="-name"):
+        vmname=str(sys.argv[x+1])
+    x += 1
+if (vmname==""):
+    sys.exit(0)
+tree = ET.parse('/etc/libvirt/qemu/' + vmname+'.xml')
+root = tree.getroot()
+devices=root.find('devices')
+spicechannel = ET.Element("channel",{'type': 'unix'})
+devices.append(spicechannel)
+spicechannel.append(ET.Element("source",{'mode': 'bind'}))
+spicechannel.append(ET.Element("target",{'type': 'virtio', 'name': 'com.kvm-vdi.0'}))
+spicechannel.append(ET.Element("address",{'type': 'virtio-serial', 'controller': '0', 'bus': '0', 'port': '3'}))
+emulator = devices.find('emulator')
+emulator.text='/usr/local/VDI/vdi-wrapper'
+graphics = devices.find('graphics')
+#we need to remove cdrom element, which was set during installation:
+for disk in devices.findall('disk'):
+    devtype=disk.get('device')
+    if devtype == 'cdrom':
+        image_path = disk.find('source')
+        if image_path:
+            image_path.clear()
+#we need to remove password element, which was set during installation:
+graphics.clear()
+graphics.set('type','spice')
+graphics.set('autoport','yes')
+graphics.set('listen','0.0.0.0')
+gr=ET.SubElement(graphics, 'listen')
+gr.set('type', 'address')
+gr.set('address', '0.0.0.0')
+gr=ET.SubElement(graphics, 'image')
+gr.set('compression', 'auto_glz')
+gr=ET.SubElement(graphics, "streaming")
+gr.set('mode', 'filter')
+gr=ET.SubElement(graphics, 'mouse')
+gr.set('mode', 'client')
+gr=ET.SubElement(graphics, 'clipboard')
+gr.set('copypaste', 'no')
+#we need to determine OS distro, because Redat does not have "filetransfer" option:
+distribution=platform.dist()
+if 'centos' not in distribution and 'redhat' not in distribution and 'fedora' not in distribution and 'oracle' not in distribution:
+    gr=ET.SubElement(graphics, 'filetransfer')
+    gr.set('enable', 'no')
+tree.write('/tmp/' + vmname + '_new.xml')
+os.system("virsh define /tmp/" + vmname + "_new.xml")
+os.remove("/tmp/" + vmname + "_new.xml")

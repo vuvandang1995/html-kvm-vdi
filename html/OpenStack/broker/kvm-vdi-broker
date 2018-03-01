@@ -1,0 +1,157 @@
+#!/usr/bin/env python
+
+
+import socket
+import os, os.path
+import logging
+import logging.config
+import json
+from threading import Thread
+from ConfigParser import ConfigParser
+import ConsoleProxy 
+import VMBuilder
+import Variables
+import threading
+import requests
+import time
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+
+class maintenanceBroker(threading.Thread):
+    def __init__(self):
+        super(maintenanceBroker, self).__init__()
+        self._stop = threading.Event()
+    def stop(self):
+        self._stop.set()
+    def stopped(self):
+        return self._stop.isSet()
+    def login(self):
+        http_session = requests.session()
+        reply=http_session.post(Variables.dashboard_path+"inc/infrastructure/OpenStack/BrokerLogin.php", data={'password': dashboard_password}, verify=False, headers=Variables.http_headers)
+        return http_session
+    def run(self):
+        while True and not Variables.terminate:
+            logger = logging.getLogger('kvm-vdi-broker')
+            http_session = self.login()
+            reply = json.loads(http_session.get(Variables.dashboard_path+"inc/infrastructure/OpenStack/ListVDIVMSRebuild.php", verify=False, headers=Variables.http_headers).text)
+            if 'error' in reply:
+                logger.info("Failed to connect to dashboard");
+                return 1
+            else:
+                for vm in reply:
+                    if Variables.vms_to_build.get(vm['osInstanceId'], None) is None: # if ephemeral vm was not yet built
+                        Variables.vms_to_build[vm['osInstanceId']] = True
+                        vmbuilder = VMBuilder.VMBuilder(vm['name'] + '-ephemeral', vm['osInstanceId'], vm['ephemeral_osInstanceId'], http_session).start()
+            time.sleep(10)
+
+
+class createChannel(threading.Thread):
+    def __init__(self, target_ip, target_port, bind_port, vm_id, conn):
+        super(createChannel, self).__init__()
+        self._stop = threading.Event()
+        self.target_ip = target_ip
+        self.target_port = target_port
+        self.bind_port = bind_port
+        self.vm_id = vm_id
+        self.conn = conn
+    def stop(self):
+        self._stop.set()
+    def stopped(self):
+        return self._stop.isSet()
+    def run(self):
+        global redirectorExit
+        logger = logging.getLogger('kvm-vdi-broker')
+        logger.debug("spiceChannel listener started on port %s", self.bind_port)
+        Client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        Client.settimeout(10)
+        Client.bind(('0.0.0.0', self.bind_port))
+        Client.listen(5)
+        x = 0;
+        th = {};
+        self.conn.send(json.dumps({"spice_port": self.bind_port}))
+        while True:
+            try:
+                spiceClient, addr = Client.accept()
+                logger.debug("Client connected on port %s", self.bind_port)
+            except KeyboardInterrupt:
+                redirectorExit = True
+                break
+            except socket.timeout:
+                break
+            th[x] = ConsoleProxy.spiceChannel(spiceClient, self.target_ip, self.target_port) #we need to thread client sockets, because SPICE client opens more than one stream to server.
+            th[x].start()
+            x += 1
+        logger.debug("Waiting for spiceChannel client exit on port %s", self.bind_port)
+        while x > 0: # Waiting for all redirector threads to exit
+            x -= 1
+            th[x].join()
+        logger.debug("Closing spiceChannel listener on port %s", self.bind_port)
+        active_vms.pop(self.vm_id, None) # Removing vm from active sessions list
+        ports.append(self.bind_port) # making listener port available for next client session
+        Client.close()
+
+def main():
+    sockfile = "/usr/local/kvm-vdi/kvm-vdi-broker.sock"
+    logdir = "/var/log/VDI";
+    if not os.path.exists(logdir):
+        os.makedirs(logdir)
+    if os.path.exists( sockfile ):
+        os.remove( sockfile )
+    logging.config.fileConfig('/etc/kvm-vdi/kvm-vdi.cfg')
+    logger = logging.getLogger('kvm-vdi-broker')
+    server = socket.socket( socket.AF_UNIX, socket.SOCK_STREAM )
+    server.bind(sockfile)
+    os.chmod(sockfile, 0o777)
+    server.listen(5)
+    config = ConfigParser()
+    config.read('/etc/kvm-vdi/kvm-vdi.cfg')
+    global dashboard_password
+    Variables.dashboard_path = config.get('server', 'address')
+    dashboard_password = config.get('server', 'password')
+    port_range = config.get('broker', 'port_range')
+    port_range = port_range.split(':')
+    global ports
+    global active_vms
+    ports = list(range(int(port_range[0]), int(port_range[1]) + 1))
+    ports.reverse()
+    Variables.terminate = 0
+    logger.info("Starting KVM-VDI broker")
+    active_vms = {}
+    maintenanceBroker().start()
+    try:
+        while True:
+            conn, addr = server.accept()
+            while True: 
+                data = conn.recv( 1024 )
+                if data:
+#                    try:
+                    command=json.loads(data)
+                    logger.debug(data)
+                    if command['command'] == 'make-spice-channel':
+                        if active_vms.get(command['vm_id'], None) is not None:
+                            logger.debug("Channel for vm %s is already initialised", command['vm_id'])
+                            bind_port = active_vms[command['vm_id']]
+                            conn.send(json.dumps({"error": "in use"}))
+                        elif not command['hypervisor_ip'] or not command['spice_port']:
+                            logger.debug("Got empty hypervisor ip / port")
+                            conn.send(json.dumps({"error": "empty-values"}))
+                        else:
+                            bind_port = ports.pop()
+                            active_vms[command['vm_id']]=bind_port
+                            t = createChannel(command['hypervisor_ip'], command['spice_port'], bind_port, command['vm_id'], conn)
+                            t.start()
+#                    except:
+#                        logger.debug("Invalid json data received" + data)
+                if not data:
+                    break
+                break
+    except KeyboardInterrupt:
+        logger.debug("Keyboard interrupt")
+    Variables.terminate = 1
+    time.sleep(1)
+    server.close()
+    os.remove( sockfile )
+
+if __name__ == '__main__':
+    main()

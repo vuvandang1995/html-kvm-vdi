@@ -1,0 +1,257 @@
+#!/usr/bin/env python
+import gtk, glib
+import webkit
+import json
+from ConfigParser import ConfigParser
+import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+from PyQt4 import QtGui
+import sys
+import threading
+from random import choice
+from string import ascii_uppercase
+from string import ascii_lowercase
+from string import digits
+import os
+import time
+import logging
+import logging.config
+
+config = ConfigParser()
+config.read('/usr/local/VDI-client/config')
+logging.config.fileConfig('/usr/local/VDI-client/config')
+logger = logging.getLogger('root')
+dashboard_path = config.get('server', 'address')
+use_hypervisor_address = config.get('remote_viewer', 'use_hypervisor_address')
+autologin = int(config.get('remote_viewer', 'autologin'))
+cfg_username = config.get('remote_viewer', 'username')
+cfg_password = config.get('remote_viewer', 'password')
+autoexit = config.getboolean('remote_viewer', 'autoexit')
+
+
+http_headers = {
+    'User-Agent': 'KVM-VDI client',
+}
+w = gtk.Window()
+v = webkit.WebView()
+v.props.settings.props.enable_default_context_menu = False
+sw = gtk.ScrolledWindow()
+w.add(sw)
+sw.add(v)
+w.maximize()
+w.connect("destroy", lambda q: gtk.main_quit())
+http_session = requests.session()
+username = ""
+password = ""
+refresh_run = 1
+client_path = ""
+engine = ""
+client_path = "/client.php"
+
+class Login(QtGui.QDialog):
+    def __init__(self, parent=None):
+        super(Login, self).__init__(parent)
+        self.User = QtGui.QLineEdit(self)
+        self.Pass = QtGui.QLineEdit(self)
+        self.LabelUser=QtGui.QLabel(self)
+        self.LabelUser.setText("Username:")
+        self.LabelPass=QtGui.QLabel(self)
+        self.LabelPass.setText("Password:")
+        self.Pass.setEchoMode(QtGui.QLineEdit.Password)
+        self.buttonLogin = QtGui.QPushButton('Login', self)
+        self.buttonLogin.clicked.connect(self.handleLogin)
+        layout = QtGui.QVBoxLayout(self)
+        layout.addWidget(self.LabelUser)
+        layout.addWidget(self.User)
+        layout.addWidget(self.LabelPass)
+        layout.addWidget(self.Pass)
+        layout.addWidget(self.buttonLogin)
+    def handleLogin(self):
+        global username
+        global password
+        global client_path
+        global engine
+        username = str(self.User.text())
+        password = str(self.Pass.text())
+        reply = http_session.post(dashboard_path+"client_pools.php", data={'username': username, 'password': password}, verify=False, headers=http_headers)
+        if reply.text!='LOGIN_FAILURE':
+            v.connect("notify::title", pool_click)
+            v.load_html_string(str(reply.text),dashboard_path)
+            if reply.headers['KVM-VDI-engine'] == 'OpenStack':
+                logger.debug("Using OpenStack engine")
+                engine = reply.headers['KVM-VDI-engine']
+                client_path = "/inc/infrastructure/OpenStack/GetClientConnection.php"
+            else:
+                logger.debug("Using KVM engine")
+            self.accept()
+        else:
+            QtGui.QMessageBox.warning(self, 'Error', 'Bad user or password')
+
+def AutoLogin():
+    global username
+    global password
+    username=cfg_username
+    password=cfg_password
+    reply=http_session.post(dashboard_path+"client_pools.php", data={'username': username, 'password': password}, verify=False, headers=http_headers)
+    if reply.text!='LOGIN_FAILURE':
+        v.connect("notify::title", pool_click)
+        v.load_html_string(str(reply.text),dashboard_path)
+
+class vm_heartbeat(threading.Thread):
+    def __init__(self, vm_id):
+        super(vm_heartbeat, self).__init__()
+        self._stop = threading.Event()
+        self.vm_id = vm_id
+    def stop(self):
+        self._stop.set()
+    def stopped(self):
+        return self._stop.isSet()
+    def run(self):
+        global engine
+        seconds=0
+        while not self.stopped():
+            if seconds==30:
+                if engine == 'OpenStack':
+                    hb_reply = http_session.post(dashboard_path+"client_hb.php", data={'vm_id': self.vm_id}, verify=False, headers=http_headers)
+                else:
+                    hb_reply = http_session.post(dashboard_path+"client_hb.php", data={'vmname': self.vm_id}, verify=False, headers=http_headers)
+                logger.debug("VM heartbeat")
+                seconds=0
+            if not self.stopped() and seconds < 30: #sleep for one second. Longer sleep times cause thread to wait on exit.
+                time.sleep(1)
+                seconds += 1
+
+def dashboard_reload():
+    try:
+        page=http_session.get(dashboard_path+"client_pools.php", verify=False, headers=http_headers)
+        glib.idle_add(v.load_html_string,str(page.text),dashboard_path)
+    except:
+        logger.debug ("Dashboard timeout")
+
+class refresh_timer(threading.Thread):
+    def __init__(self):
+        super(refresh_timer, self).__init__()
+        self._stop = threading.Event()
+    def stop(self):
+        self._stop.set()
+    def stopped(self):
+        return self._stop.isSet()
+    def run(self):
+        global refresh_run
+        seconds=0
+        while not self.stopped():
+            if seconds==5:
+                if refresh_run==1:
+                    logger.debug ("Dashboard reload")
+                    dashboard_reload()
+                seconds=0
+            if not self.stopped() and seconds < 5: #sleep for one second. Longer sleep times cause thread to wait on exit.
+                time.sleep(1)
+                seconds += 1
+
+
+class remote_viewer(threading.Thread):
+    def __init__(self,data):
+        super(remote_viewer, self).__init__()
+        self._stop = threading.Event()
+        self.data = data
+    def stop(self):
+        self._stop.set()
+    def stopped(self):
+        return self._stop.isSet()
+    def run(self):
+        global refresh_run
+        if engine == 'OpenStack':
+            vm_id = self.data['vm_id']
+        else:
+            vm_id = self.data['name']
+        t = vm_heartbeat(vm_id)
+        t.daemon=True
+        t.start()
+        tmp=self.data["address"].split(":")
+        spice_password=self.data["spice_password"]
+        tmpname=(''.join(choice(ascii_uppercase+ascii_lowercase+digits) for i in range(13)))
+        viewer_config=ConfigParser()
+        viewer_config.add_section('virt-viewer')
+        viewer_config.set('virt-viewer', 'type', 'spice')
+        viewer_config.set('virt-viewer', 'host', tmp[0])
+        viewer_config.set('virt-viewer', 'port', tmp[1])
+        viewer_config.set('virt-viewer', 'delete-this-file', '0')
+        viewer_config.set('virt-viewer', 'password', spice_password)
+        with open('/tmp/' + tmpname + '.cfg', 'wb') as configfile:
+            viewer_config.write(configfile)
+        os.system("remote-viewer --kiosk-quit=on-disconnect  --kiosk /tmp/" + tmpname + ".cfg ")
+        dashboard_reload();
+        logger.info("Exiting virt-viewer")
+        refresh_run=1
+        t.stop()
+        t.join()
+        if autoexit:
+            logger.debug("autoexit is set to 1, exiting kvm-vdi-client")
+            os._exit(0)
+        self.stop()
+
+
+
+def pool_click(v, param):
+    if not v.get_title():
+        return
+    if v.get_title().startswith("kvm-vdi-msg:"):
+        vdi_message=v.get_title().replace("kvm-vdi-msg:","")
+        if vdi_message.startswith("PM:"):
+            vdi_message=vdi_message.replace("PM:","")
+            vdi_PM=vdi_message.split(":")
+            if vdi_PM[0]=="shutdown":
+                PM_reply=http_session.post(dashboard_path+"client_power.php", data={'vm': vdi_PM[1], 'action': "shutdown"}, verify=False, headers=http_headers)
+            if vdi_PM[0]=="destroy":
+                PM_reply=http_session.post(dashboard_path+"client_power.php", data={'vm': vdi_PM[1], 'action': "destroy"}, verify=False, headers=http_headers)
+            dashboard_reload()
+        else:
+            global refresh_run
+            refresh_run=0;
+            poolid=vdi_message
+            reply=http_session.post(dashboard_path + client_path, data={'pool': poolid, 'protocol': "SPICE", 'username': username, 'password': password, 'use_hypervisor_address': use_hypervisor_address} ,verify=False, headers=http_headers);
+            data=json.loads(reply.text)
+            logger.debug(data)
+            if data['status']=='MAINTENANCE':
+                dashboard_reload()
+                refresh_run=1
+            if data['status']=='NO_FREE_VMS':
+                dashboard_reload()
+                refresh_run=1
+            retries=0
+            while data['status']=="BOOTUP" and retries < 10 :
+                logger.info("BOOTUP, waiting")
+                reply=http_session.post(dashboard_path + client_path, data={'pool': poolid, 'protocol': "SPICE", 'username': username, 'password': password, 'use_hypervisor_address': use_hypervisor_address} ,verify=False, headers=http_headers);
+                data=json.loads(reply.text)
+                time.sleep(1)
+            logger.debug("Got reply from dashboard: %s", data)
+            if data['status']=='OK':
+                #dashboard_reload()
+                logger.info("OK, starting HB thread & viewer")
+                viewer=remote_viewer(data)
+                viewer.start()
+
+
+app = QtGui.QApplication(sys.argv)
+if not autologin:
+    login = Login()
+    if login.exec_() == QtGui.QDialog.Accepted:
+        r_t=refresh_timer()
+        r_t.start()
+        w.set_title("KVM-VDI client")
+        w.show_all()
+        gtk.main()
+else:
+    AutoLogin()
+    r_t=refresh_timer()
+    r_t.start()
+    w.set_title("KVM-VDI client")
+    w.show_all()
+    gtk.main()
+r_t.stop()
+r_t.join()
+#t.stop()
+#r_t.join()
+#t.join()
